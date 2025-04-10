@@ -1,17 +1,12 @@
 import json
 import pandas as pd
 import chromadb
-from chromadb.config import Settings
-from sentence_transformers import SentenceTransformer
 import openai
 import os
 from dotenv import load_dotenv
 from tqdm import tqdm
 
-import sys
-import logging
-import warnings
-from datetime import datetime
+import streamlit as st
 
 
 # Load environment variables
@@ -34,7 +29,10 @@ def prepare_chroma_collection(
     openai_model="text-embedding-ada-002",
     save_path="chroma_collection.json",
 ):
-    client = chromadb.Client()
+    # client = chromadb.Client()
+    client = chromadb.PersistentClient(
+        path="./chroma_db_for_agit_data"
+    )  # 지정된 경로에 DB 생성
 
     # Check if the collection file exists
     if os.path.exists(save_path):
@@ -62,19 +60,29 @@ def prepare_chroma_collection(
         response = openai.Embedding.create(
             input=item["contents"], model=openai_model, api_key=OPENAI_API_KEY
         )
-
         embedding = response["data"][0]["embedding"]
+
         collection.add(
-            ids=[str(i)],
+            ids=[item["parentID"]],
             documents=[item["contents"]],
-            metadatas=[{"id": i, "contents": item["contents"]}],
+            metadatas=[
+                {
+                    "id": item["parentID"],
+                    "url": item["url"],
+                    "answer_query": item["answer_query"],
+                }
+            ],
             embeddings=[embedding],
         )
         saved_data.append(
             {
-                "id": str(i),
+                "id": item["parentID"],
                 "document": item["contents"],
-                "metadata": {"id": i, "contents": item["contents"]},
+                "metadata": {
+                    "id": item["parentID"],
+                    "url": item["url"],
+                    "answer_query": item["answer_query"],
+                },
                 "embedding": embedding,
             }
         )
@@ -96,21 +104,37 @@ def hybrid_search(collection, user_input, k=5):
         api_key=OPENAI_API_KEY,
     )["data"][0]["embedding"]
 
-    # Semantic search
+    # Perform semantic search
     semantic_results = collection.query(query_embeddings=[embedding], n_results=k)
 
-    # Keyword search (simple filtering based on keyword presence)
+    # Perform keyword search by checking if the user input is in the document
     keyword_results = [
-        {"content": doc["contents"], "score": 1.0}
-        for doc in collection.get()["metadatas"]
-        if user_input.lower() in doc["contents"].lower()
+        {
+            "document": doc,  # Extract the first element from the list
+            "metadata": metadata,  # Extract the first element from the list
+            "score": 1.0,  # Assign a fixed score for keyword matches
+        }
+        for doc, metadata in zip(
+            collection.get()["documents"][0], collection.get()["metadatas"][0]
+        )
+        if user_input.lower() in doc.lower()  # Access the first element for comparison
     ]
 
-    # Combine results (prioritize semantic results, then add keyword results)
-    combined_results = semantic_results["metadatas"]
-    for keyword_result in keyword_results:
-        if keyword_result not in combined_results:
-            combined_results.append(keyword_result)
+    # Combine results: prioritize semantic results, then add keyword results
+    combined_results = []
+    seen_ids = set()
+
+    # Add semantic results first
+    for doc, metadata in zip(
+        semantic_results["documents"][0], semantic_results["metadatas"][0]
+    ):
+        combined_results.append({"document": doc, "metadata": metadata})
+        seen_ids.add(metadata["id"])
+
+    # Add keyword results if not already in semantic results
+    for result in keyword_results:
+        if result["metadata"]["id"] not in seen_ids:
+            combined_results.append(result)
 
     return combined_results[:k]
 
@@ -118,38 +142,72 @@ def hybrid_search(collection, user_input, k=5):
 # Step 4: Convert results to DataFrame
 def results_to_dataframe(results):
     df = pd.DataFrame(results)
-
-    # Save DataFrame to a CSV file
-    dataframe_file = (
-        "/Users/kakaovx/Desktop/agent_test/rag_test_max/results_dataframe.csv"
-    )
-    df.to_csv(dataframe_file, index=False, encoding="utf-8-sig")
-
     return df
 
 
 # Main function
 def main():
-    # Load JSON data
-    file_path = (
-        "/Users/kakaovx/Desktop/agent_test/rag_test_max/preprocessed_bk_requests.json"
+
+    # Use session state to ensure this runs only once
+    if "collection" not in st.session_state:
+        # Load JSON data
+        file_path = "preprocessed_bk_requests.json"
+        data = load_json(file_path)
+
+        # Prepare Chroma collection
+        st.session_state.collection = prepare_chroma_collection(data)
+
+    # Retrieve the collection from session state
+    collection = st.session_state.collection
+
+    # Streamlit app
+    st.title("Hybrid Search Test")
+
+    user_input = st.text_input("Enter your query:", "")
+    # Get the number of documents in the collection
+    collection_size = len(collection.get()["documents"])
+
+    # Add a slider to select the number of results, limited by the collection size
+    max_results = st.number_input(
+        "Enter the top-k value to retrieve:",
+        min_value=1,
+        max_value=collection_size,
+        value=min(5, collection_size),
+        step=1,
     )
-    data = load_json(file_path)
 
-    # Prepare Chroma collection
-    collection = prepare_chroma_collection(data)
+    # Validate the input and show an error message if out of range
+    if max_results < 1 or max_results > collection_size:
+        st.error(f"Please enter a value between 1 and {collection_size}.")
+    else:
+        k = int(max_results)
 
-    while True:
-        # User input
-        user_input = input("Enter your query: ")
+    if st.button("Search"):
+        if user_input.strip():
+            # Perform hybrid search
+            results = hybrid_search(collection, user_input, k)
 
-        # Perform hybrid search
-        k = 5  # Number of top results to retrieve
-        results = hybrid_search(collection, user_input, k)
+            # Convert results to DataFrame
+            df = results_to_dataframe(results)
 
-        # Convert results to DataFrame
-        df = results_to_dataframe(results)
-        print(df)
+            # Display results
+            st.write("## Search Results:")
+            for index, row in df.iterrows():
+
+                # Reorder metadata keys to ensure consistent order
+                ordered_metadata = {
+                    "id": row["metadata"]["id"],
+                    "url": row["metadata"]["url"],
+                    "answer_query": row["metadata"]["answer_query"],
+                }
+
+                document = row["document"]
+
+                with st.expander(f"### Result {index + 1}", expanded=True):
+                    st.write("##### Metadata:", ordered_metadata)
+                    st.text("Document: \n\n" + str(document))
+        else:
+            st.warning("Please enter a query to search.")
 
 
 if __name__ == "__main__":
